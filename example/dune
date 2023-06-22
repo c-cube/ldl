@@ -1,0 +1,4 @@
+
+(executables
+  (names cat tcp_echo)
+  (libraries ldl unix))

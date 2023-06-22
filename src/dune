@@ -1,0 +1,3 @@
+(library
+ (public_name ldl)
+ (libraries poll bigarray))
