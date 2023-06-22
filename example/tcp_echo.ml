@@ -9,22 +9,33 @@ let () =
   Unix.bind server_sock (Unix.ADDR_INET (Unix.inet_addr_loopback, port));
   Unix.listen server_sock 32;
   Unix.setsockopt_optint server_sock Unix.SO_LINGER None;
+  Unix.setsockopt server_sock Unix.SO_REUSEPORT true;
   Unix.set_nonblock server_sock;
 
   Ldl.run @@ fun () ->
   while true do
-    let client_sock = Ldl.accept server_sock in
+    let client_sock, client_addr = Ldl.accept server_sock in
     Unix.set_nonblock client_sock;
-    epf "got client!\n%!";
+    let client_ip, client_port =
+      match client_addr with
+      | Unix.ADDR_INET (ip, port) -> Unix.string_of_inet_addr ip, port
+      | _ -> assert false
+    in
+    epf "got client on %s:%d!\n%!" client_ip client_port;
 
     let _fib_client =
       Fib.spawn (fun () ->
           let buf = Bytes.create 128 in
-          while true do
+          let continue = ref true in
+          while !continue do
             let n = Ldl.read client_sock buf 0 (Bytes.length buf) in
-            epf "got %d bytes from client\n%!" n;
-            Ldl.write_all client_sock buf 0 n
-          done)
+            epf "got %d bytes from client %s:%d\n%!" n client_ip client_port;
+            if n > 0 then
+              Ldl.write_all client_sock buf 0 n
+            else
+              continue := false
+          done;
+          epf "client %s:%d disconnected\n%!" client_ip client_port)
     in
     ()
   done;

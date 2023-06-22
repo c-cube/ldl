@@ -15,7 +15,9 @@ let run (f : unit -> 'a) : 'a =
 
 let read fd buf i len : int = Effect.perform (Effects_.Read (fd, buf, i, len))
 let write fd buf i len : int = Effect.perform (Effects_.Write (fd, buf, i, len))
-let accept fd : Unix.file_descr = Effect.perform (Effects_.Accept fd)
+
+let accept fd : Unix.file_descr * Unix.sockaddr =
+  Effect.perform (Effects_.Accept fd)
 
 let write_all fd buf i len : unit =
   let i = ref i in

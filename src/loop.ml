@@ -12,7 +12,7 @@ end)
 
 type suspended_reader =
   | Read of (int, unit) E.continuation * bytes * int * int
-  | Accept of (Unix.file_descr, unit) E.continuation
+  | Accept of (Unix.file_descr * Unix.sockaddr, unit) E.continuation
 
 type suspended_writer = (int, unit) E.continuation * bytes * int * int
 
@@ -84,23 +84,29 @@ let try_write_once_ fd buf i len =
 
 let try_accept fd =
   match Unix.accept fd with
-  | sock, _ -> Some sock
+  | sock, addr -> Some (sock, addr)
   | exception Unix.Unix_error ((Unix.EWOULDBLOCK | Unix.EAGAIN), _, _) -> None
 
 let do_read (self : t) k fd buf i len : unit =
-  match try_read_once_ fd buf i len with
-  | Some n -> E.continue k n
-  | None -> add_read_sub_for_fd self fd @@ Read (k, buf, i, len)
+  try
+    match try_read_once_ fd buf i len with
+    | Some n -> E.continue k n
+    | None -> add_read_sub_for_fd self fd @@ Read (k, buf, i, len)
+  with e -> E.discontinue k e
 
 let do_write (self : t) k fd buf i len : unit =
-  match try_write_once_ fd buf i len with
-  | Some n -> E.continue k n
-  | None -> add_write_sub_for_fd self fd (k, buf, i, len)
+  try
+    match try_write_once_ fd buf i len with
+    | Some n -> E.continue k n
+    | None -> add_write_sub_for_fd self fd (k, buf, i, len)
+  with e -> E.discontinue k e
 
 let do_accept (self : t) k fd : unit =
-  match try_accept fd with
-  | Some sock -> E.continue k sock
-  | None -> add_read_sub_for_fd self fd @@ Accept k
+  try
+    match try_accept fd with
+    | Some (sock, addr) -> E.continue k (sock, addr)
+    | None -> add_read_sub_for_fd self fd @@ Accept k
+  with e -> E.discontinue k e
 
 (** Try to have one of the read subscribers do a read *)
 let try_to_wakeup_sub_read (self : t) fd : unit =
@@ -110,15 +116,26 @@ let try_to_wakeup_sub_read (self : t) fd : unit =
     (match r0 with
     | Accept k ->
       (match try_accept fd with
-      | Some sock -> enqueue_task self (fun () -> E.continue k sock)
-      | None -> ())
+      | Some sock ->
+        subs.readers <- tl;
+        update_poll_event self fd subs;
+        enqueue_task self (fun () -> E.continue k sock)
+      | None -> ()
+      | exception e ->
+        subs.readers <- tl;
+        update_poll_event self fd subs;
+        E.discontinue k e)
     | Read (k, buf, i, len) ->
       (match try_read_once_ fd buf i len with
       | Some n ->
         subs.readers <- tl;
         update_poll_event self fd subs;
         enqueue_task self (fun () -> E.continue k n)
-      | None -> (* still registered *) ()))
+      | None -> (* still registered *) ()
+      | exception e ->
+        subs.readers <- tl;
+        update_poll_event self fd subs;
+        E.discontinue k e))
 
 (** Try to have one of the write subscribers do a write *)
 let try_to_wakeup_sub_write (self : t) fd : unit =
@@ -130,7 +147,11 @@ let try_to_wakeup_sub_write (self : t) fd : unit =
       subs.writers <- tl;
       update_poll_event self fd subs;
       enqueue_task self (fun () -> E.continue k n)
-    | None -> (* still registered *) ())
+    | None -> (* still registered *) ()
+    | exception e ->
+      subs.writers <- tl;
+      update_poll_event self fd subs;
+      E.discontinue k e)
 
 let with_handler self f x =
   E.try_with f x
