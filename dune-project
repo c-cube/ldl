@@ -14,7 +14,9 @@
 (package
  (name ldl)
  (synopsis "A basic event loop for OCaml 5")
- (depends (ocaml (>= 5.0)) dune poll (mdx :with-test))
+ (depends (ocaml (>= 5.0)) dune poll
+          ;(mdx :with-test)
+          )
  (tags (ocaml5 fiber pool)))
 
 ; See the complete stanza docs at https://dune.readthedocs.io/en/stable/dune-files.html#dune-project
