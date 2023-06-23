@@ -153,7 +153,7 @@ let try_to_wakeup_sub_write (self : t) fd : unit =
       update_poll_event self fd subs;
       E.discontinue k e)
 
-let with_handler self f x =
+let rec with_handler self f x =
   E.try_with f x
     {
       E.effc =
@@ -167,7 +167,7 @@ let with_handler self f x =
             Some
               (fun (k : (a, _) E.continuation) ->
                 (* schedule [f] and resume *)
-                enqueue_task self f;
+                enqueue_task_with_handler self f;
                 E.continue k ())
           | Effects_.Read (fd, buf, i, len) ->
             Some
@@ -180,11 +180,18 @@ let with_handler self f x =
           | _ -> None);
     }
 
+and enqueue_task_with_handler self f : unit =
+  enqueue_task self (fun () -> with_handler self f ())
+
 (** run immediate tasks *)
 let run_microtasks (self : t) =
   while not (Queue.is_empty self.q) do
     let task = Queue.pop self.q in
-    with_handler self task ()
+    try task ()
+    with e ->
+      let bt = Printexc.get_raw_backtrace () in
+      Printf.eprintf "uncaught exceptions: %s\n%s\n%!" (Printexc.to_string e)
+        (Printexc.raw_backtrace_to_string bt)
   done
 
 let poll (self : t) : unit =
@@ -212,6 +219,6 @@ let main_loop (self : t) : unit =
 
 let run (self : t) (f : unit -> 'a) : 'a =
   let _fiber, run = Fiber.Internal_.create f in
-  enqueue_task self run;
+  enqueue_task_with_handler self run;
   main_loop self;
   assert false (* TODO: have main loop stop when [fiber] is done *)
