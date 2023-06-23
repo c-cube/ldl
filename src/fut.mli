@@ -59,3 +59,7 @@ val is_done : _ t -> bool
 (** Is the future resolved? This is the same as [peek fut |> Option.is_some]. *)
 
 val await : 'a t -> 'a
+(** Wait for the result *)
+
+val spawn : (unit -> 'a) -> 'a t
+(** [spawn f] spawns [f()] in a fiber, and returns the future result. *)

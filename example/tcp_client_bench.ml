@@ -7,7 +7,7 @@ let one_test ~host ~port () =
   let@ sock = Ldl.Net.with_connect host port in
 
   let buf = Bytes.create (String.length msg) in
-  for _i = 1 to 10_000 do
+  for _i = 1 to 2_000 do
     Ldl.FD.write_str sock msg;
     n_bytes_written := !n_bytes_written + String.length msg;
     Ldl.FD.read_exact sock buf 0 (String.length msg)
@@ -20,13 +20,12 @@ let run ~host ~port ~debug ~n_conn () : unit =
   Ldl.run @@ fun () ->
   (* spawn fibers to connect *)
   let fibers =
-    Array.init n_conn (fun _ ->
-        Ldl.Fiber.spawn (fun () -> one_test ~host ~port ()))
+    Array.init n_conn (fun _ -> Ldl.spawn (fun () -> one_test ~host ~port ()))
   in
 
   Array.iteri
     (fun i fib ->
-      Ldl.Fiber.join fib;
+      Ldl.Fut.await fib;
       if debug then epf "done with fib %d\n%!" i)
     fibers;
 

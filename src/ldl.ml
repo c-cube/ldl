@@ -1,7 +1,5 @@
 [@@@ocaml.alert "-unstable"]
 
-module Fiber = Fiber
-
 let ( let@ ) = ( @@ )
 let run = Loop.run
 
@@ -100,3 +98,7 @@ module Net = struct
     let@ () = Fun.protect ~finally:(fun () -> FD.dispose sock) in
     f sock
 end
+
+module Fut = Fut
+
+let spawn f = Fut.spawn f

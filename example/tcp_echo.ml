@@ -1,5 +1,3 @@
-module Fib = Ldl.Fiber
-
 let epf = Printf.eprintf
 
 let () =
@@ -27,7 +25,7 @@ let () =
     if !debug then epf "got client on %s:%d!\n%!" client_ip client_port;
 
     let _fib_client =
-      Fib.spawn (fun () ->
+      Ldl.spawn (fun () ->
           let buf = Bytes.create 128 in
           let continue = ref true in
           while !continue do

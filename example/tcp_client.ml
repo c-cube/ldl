@@ -10,7 +10,7 @@ let run ~host ~port () : unit =
   let continue = ref true in
 
   let _read_from_sock =
-    Ldl.Fiber.spawn (fun () ->
+    Ldl.spawn (fun () ->
         let buf = Bytes.create 128 in
         while !continue do
           let n = Ldl.FD.read sock buf 0 (Bytes.length buf) in

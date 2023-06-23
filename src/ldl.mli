@@ -3,8 +3,6 @@
     Loop-dee-loop, an event loop for OCaml 5.
 *)
 
-module Fiber = Fiber
-
 val run : (unit -> 'a) -> 'a
 (** [run f] runs [f()] in a new event loop. When [f()] returns, the loop
     terminates. Inside [f()], effects, fibers, etc. can be used. *)
@@ -37,3 +35,7 @@ module Net : sig
   val accept : FD.t -> FD.t * sockaddr
   val with_connect : string -> int -> (FD.t -> 'a) -> 'a
 end
+
+module Fut = Fut
+
+val spawn : (unit -> 'a) -> 'a Fut.t
