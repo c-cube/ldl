@@ -1,6 +1,7 @@
 [@@@ocaml.alert "-unstable"]
 
-let ( let@ ) = ( @@ )
+open Common_
+
 let run = Loop.run
 
 module FD = struct

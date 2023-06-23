@@ -26,51 +26,52 @@ module Fd_subscribers = struct
     { Poll.Event.readable = self.readers <> []; writable = self.writers <> [] }
 end
 
-type 'a t = {
+type 'a worker = {
   active: bool Atomic.t;
   poll: Poll.t;  (** Main polling structure *)
   fd_tbl: Fd_subscribers.t Fd_tbl.t;  (** Subscribers for a given FD *)
-  micro_q: task Queue.t;  (** Tasks to run immediately (micro-queue) *)
+  micro_q: task Queue.t Lock_.t;  (** Tasks to run immediately (micro-queue) *)
   main_task: 'a Fut.t;
 }
 
-let create main_task : _ t =
-  {
-    active = Atomic.make true;
-    poll = Poll.create ();
-    fd_tbl = Fd_tbl.create 128;
-    micro_q = Queue.create ();
-    main_task;
-  }
+type 'a t = {
+  workers: 'a worker array;  (** offset 0: main worker *)
+  off: int A.t;  (** round robin *)
+}
+[@@ocaml.warning "-69"]
 
-let[@inline] enqueue_task (self : _ t) (f : task) : unit =
-  Queue.push f self.micro_q
+let enqueue_task (self : _ t) (f : task) : unit =
+  let n = A.fetch_and_add self.off 1 in
+  (* pick which worker we enqueue this into *)
+  let w = self.workers.(n mod Array.length self.workers) in
+  let@ q = Lock_.with_ w.micro_q in
+  Queue.push f q
 
-let update_poll_event (self : _ t) fd (subs : Fd_subscribers.t) =
+let update_poll_event (self : _ worker) fd (subs : Fd_subscribers.t) =
   if Fd_subscribers.is_empty subs then
     Fd_tbl.remove self.fd_tbl fd
   else
     Poll.set self.poll fd (Fd_subscribers.to_event subs)
 
-let get_or_create_subs (self : _ t) fd : Fd_subscribers.t =
+let get_or_create_subs (self : _ worker) fd : Fd_subscribers.t =
   try Fd_tbl.find self.fd_tbl fd
   with Not_found ->
     let sub = Fd_subscribers.empty in
     Fd_tbl.add self.fd_tbl fd sub;
     sub
 
-let add_read_sub_for_fd (self : _ t) fd k : unit =
+let add_read_sub_for_fd (self : _ worker) fd k : unit =
   let fd_subs = get_or_create_subs self fd in
   fd_subs.readers <- k :: fd_subs.readers;
   update_poll_event self fd fd_subs
 
-let add_write_sub_for_fd (self : _ t) fd k : unit =
+let add_write_sub_for_fd (self : _ worker) fd k : unit =
   let fd_subs = get_or_create_subs self fd in
   fd_subs.writers <- k :: fd_subs.writers;
   update_poll_event self fd fd_subs
 
 (** Try to have one of the read subscribers do a read *)
-let try_to_wakeup_sub_read (self : _ t) fd : unit =
+let try_to_wakeup_sub_read (self : _ worker) fd : unit =
   match Fd_tbl.find_opt self.fd_tbl fd with
   | None | Some { readers = []; _ } -> ()
   | Some ({ readers = l; _ } as subs) ->
@@ -79,7 +80,7 @@ let try_to_wakeup_sub_read (self : _ t) fd : unit =
     update_poll_event self fd subs
 
 (** Try to have one of the write subscribers do a write *)
-let try_to_wakeup_sub_write (self : _ t) fd : unit =
+let try_to_wakeup_sub_write (self : _ worker) fd : unit =
   match Fd_tbl.find_opt self.fd_tbl fd with
   | None | Some { writers = []; _ } -> ()
   | Some ({ writers = l; _ } as subs) ->
@@ -127,21 +128,37 @@ let rec with_handler self f x =
           | _ -> None);
     }
 
-and enqueue_task_with_handler self f : unit =
+and enqueue_task_with_handler (self : _ t) f : unit =
   enqueue_task self (fun () -> with_handler self f ())
 
 (** run immediate tasks *)
-let run_microtasks (self : _ t) =
-  while not (Queue.is_empty self.micro_q) do
-    let task = Queue.pop self.micro_q in
-    try task ()
-    with e ->
-      let bt = Printexc.get_raw_backtrace () in
-      Printf.eprintf "uncaught exceptions: %s\n%s\n%!" (Printexc.to_string e)
-        (Printexc.raw_backtrace_to_string bt)
+let run_microtasks (self : _ worker) =
+  let local_q = Queue.create () in
+  while
+    (* get tasks into [local_q] *)
+    (let@ q = Lock_.with_ self.micro_q in
+     Queue.transfer q local_q);
+
+    if Queue.is_empty local_q then
+      false
+    else (
+      (* execute tasks we just grabbed *)
+      Queue.iter
+        (fun task ->
+          try task ()
+          with e ->
+            let bt = Printexc.get_raw_backtrace () in
+            Printf.eprintf "uncaught exceptions: %s\n%s\n%!"
+              (Printexc.to_string e)
+              (Printexc.raw_backtrace_to_string bt))
+        local_q;
+      true
+    )
+  do
+    ()
   done
 
-let poll (self : _ t) : unit =
+let poll (self : _ worker) : unit =
   (* now poll *)
   if Fd_tbl.length self.fd_tbl = 0 then
     (* nothing more to do.
@@ -167,15 +184,41 @@ let poll (self : _ t) : unit =
         !todo
   )
 
-let main_loop (self : _ t) : unit =
+let main_loop (self : _ t) (self : _ worker) : unit =
   while Atomic.get self.active && not (Fut.is_done self.main_task) do
     run_microtasks self;
     poll self
   done
 
+let create main_task : _ t =
+  let active = A.make true in
+
+  let mk_worker () =
+    {
+      active;
+      poll = Poll.create ();
+      fd_tbl = Fd_tbl.create 128;
+      micro_q = Lock_.create @@ Queue.create ();
+      main_task;
+    }
+  in
+
+  let j = Domain.recommended_domain_count () - 1 in
+
+  let main_worker = mk_worker () in
+  let workers = Array.init j (fun _ -> mk_worker ()) in
+  { main_worker; workers; off = A.make 0 }
+
 let run (f : unit -> 'a) : 'a =
   let fiber, run = Fut.Internal_.create f in
   let self = create fiber in
-  enqueue_task_with_handler self run;
-  main_loop self;
-  Fut.await self.main_task
+  enqueue_task_with_handler self.main_worker run;
+
+  let domains =
+    Array.map
+      (fun worker -> Domain.spawn (fun () -> main_loop self worker))
+      self.workers
+  in
+  main_loop self self.main_worker;
+  Array.iter Domain.join domains;
+  Fut.await self.main_worker.main_task
