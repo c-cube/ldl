@@ -1,6 +1,6 @@
 (** Futures *)
 
-type 'a or_error = ('a, exn * Printexc.raw_backtrace) result
+open Common_
 
 type 'a t
 (** A future with a result of type ['a]. *)
@@ -63,3 +63,11 @@ val await : 'a t -> 'a
 
 val spawn : (unit -> 'a) -> 'a t
 (** [spawn f] spawns [f()] in a fiber, and returns the future result. *)
+
+(**/**)
+
+module Internal_ : sig
+  val create : (unit -> 'a) -> 'a t * task
+end
+
+(**/**)

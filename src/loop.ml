@@ -31,7 +31,7 @@ type 'a t = {
   poll: Poll.t;  (** Main polling structure *)
   fd_tbl: Fd_subscribers.t Fd_tbl.t;  (** Subscribers for a given FD *)
   micro_q: task Queue.t;  (** Tasks to run immediately (micro-queue) *)
-  main_task: 'a Fiber.t;
+  main_task: 'a Fut.t;
 }
 
 let create main_task : _ t =
@@ -168,14 +168,14 @@ let poll (self : _ t) : unit =
   )
 
 let main_loop (self : _ t) : unit =
-  while Atomic.get self.active && not (Fiber.is_done self.main_task) do
+  while Atomic.get self.active && not (Fut.is_done self.main_task) do
     run_microtasks self;
     poll self
   done
 
 let run (f : unit -> 'a) : 'a =
-  let fiber, run = Fiber.Internal_.create f in
+  let fiber, run = Fut.Internal_.create f in
   let self = create fiber in
   enqueue_task_with_handler self run;
   main_loop self;
-  Fiber.join self.main_task
+  Fut.await self.main_task

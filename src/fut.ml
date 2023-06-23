@@ -2,7 +2,6 @@
 
 open Common_
 
-type 'a or_error = ('a, exn * Printexc.raw_backtrace) result
 type 'a waiter = 'a or_error -> unit
 
 type 'a state =
@@ -97,19 +96,21 @@ let await (self : 'a t) : 'a =
            on_result self (fun _ -> wakeup ())));
     get_or_fail_exn self
 
-let create f : 'a t * task =
-  let res, promise = make () in
-  (* task that computes [f()] and fulfills the future *)
-  let run () =
-    match f () with
-    | x -> fulfill promise (Ok x)
-    | exception exn ->
-      let bt = Printexc.get_raw_backtrace () in
-      fulfill promise (Error (exn, bt))
-  in
-  res, run
+module Internal_ = struct
+  let create f : 'a t * task =
+    let res, promise = make () in
+    (* task that computes [f()] and fulfills the future *)
+    let run () =
+      match f () with
+      | x -> fulfill promise (Ok x)
+      | exception exn ->
+        let bt = Printexc.get_raw_backtrace () in
+        fulfill promise (Error (exn, bt))
+    in
+    res, run
+end
 
 let spawn f : _ t =
-  let res, run = create f in
+  let res, run = Internal_.create f in
   Effect.perform (Effects_.Schedule run);
   res
