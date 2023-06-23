@@ -57,3 +57,5 @@ val get_or_fail_exn : 'a t -> 'a
 
 val is_done : _ t -> bool
 (** Is the future resolved? This is the same as [peek fut |> Option.is_some]. *)
+
+val await : 'a t -> 'a

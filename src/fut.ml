@@ -83,3 +83,16 @@ let fulfill (self : _ t) (r : _ result) : unit =
 
 let[@inline] fulfill_idempotent self r =
   try fulfill self r with Already_fulfilled -> ()
+
+let await (self : 'a t) : 'a =
+  match peek self with
+  | Some (Ok x) -> x
+  | Some (Error (exn, bt)) -> Printexc.raise_with_backtrace exn bt
+  | None ->
+    (* wait for completion *)
+    Effect.perform
+      (Effects_.Suspend
+         (fun wakeup ->
+           (* call [wakeup()] when the function is done *)
+           on_result self (fun _ -> wakeup ())));
+    get_or_fail_exn self

@@ -4,10 +4,11 @@ open Common_
 
 type 'a t
 
-val res : 'a t -> 'a Fut.t
-
 val spawn : (unit -> 'a) -> 'a t
 (** [spawn f] spawns a new fiber evaluating [f()] *)
+
+val join : 'a t -> 'a
+val is_done : _ t -> bool
 
 (**/**)
 

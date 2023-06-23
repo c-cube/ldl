@@ -1,20 +1,18 @@
-module F = Ldl.Fiber
-
 let epf = Printf.eprintf
 
 let () =
   Ldl.run @@ fun () ->
-  Unix.set_nonblock Unix.stdin;
-  Unix.set_nonblock Unix.stdout;
+  let stdin = Ldl.File.stdin () in
+  let stdout = Ldl.File.stdout () in
 
   let buf = Bytes.create 32 in
 
   let continue = ref true in
   while !continue do
-    let n = Ldl.read Unix.stdin buf 0 (Bytes.length buf) in
+    let n = Ldl.FD.read stdin buf 0 (Bytes.length buf) in
     if n = 0 then
       continue := false
     else
-      Ldl.write_all Unix.stdout buf 0 n
+      Ldl.FD.write_all stdout buf 0 n
   done;
   epf "done\n%!"

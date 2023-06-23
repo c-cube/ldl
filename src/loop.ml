@@ -10,11 +10,8 @@ module Fd_tbl = Hashtbl.Make (struct
   let hash = Hashtbl.hash
 end)
 
-type suspended_reader =
-  | Read of (int, unit) E.continuation * bytes * int * int
-  | Accept of (Unix.file_descr * Unix.sockaddr, unit) E.continuation
-
-type suspended_writer = (int, unit) E.continuation * bytes * int * int
+type suspended_reader = (unit, unit) E.continuation
+type suspended_writer = (unit, unit) E.continuation
 
 module Fd_subscribers = struct
   type t = {
@@ -29,129 +26,66 @@ module Fd_subscribers = struct
     { Poll.Event.readable = self.readers <> []; writable = self.writers <> [] }
 end
 
-type t = {
+type 'a t = {
   active: bool Atomic.t;
   poll: Poll.t;  (** Main polling structure *)
   fd_tbl: Fd_subscribers.t Fd_tbl.t;  (** Subscribers for a given FD *)
-  q: task Queue.t;  (** Tasks to run immediately (micro-queue) *)
+  micro_q: task Queue.t;  (** Tasks to run immediately (micro-queue) *)
+  main_task: 'a Fiber.t;
 }
 
-let create () : t =
+let create main_task : _ t =
   {
     active = Atomic.make true;
     poll = Poll.create ();
     fd_tbl = Fd_tbl.create 128;
-    q = Queue.create ();
+    micro_q = Queue.create ();
+    main_task;
   }
 
-let close self = if Atomic.exchange self.active false then Poll.close self.poll
-let[@inline] enqueue_task (self : t) (f : task) : unit = Queue.push f self.q
+let[@inline] enqueue_task (self : _ t) (f : task) : unit =
+  Queue.push f self.micro_q
 
-let update_poll_event (self : t) fd (subs : Fd_subscribers.t) =
+let update_poll_event (self : _ t) fd (subs : Fd_subscribers.t) =
   if Fd_subscribers.is_empty subs then
     Fd_tbl.remove self.fd_tbl fd
   else
     Poll.set self.poll fd (Fd_subscribers.to_event subs)
 
-let get_or_create_subs (self : t) fd : Fd_subscribers.t =
+let get_or_create_subs (self : _ t) fd : Fd_subscribers.t =
   try Fd_tbl.find self.fd_tbl fd
   with Not_found ->
     let sub = Fd_subscribers.empty in
     Fd_tbl.add self.fd_tbl fd sub;
     sub
 
-let add_read_sub_for_fd (self : t) fd k : unit =
+let add_read_sub_for_fd (self : _ t) fd k : unit =
   let fd_subs = get_or_create_subs self fd in
   fd_subs.readers <- k :: fd_subs.readers;
   update_poll_event self fd fd_subs
 
-let add_write_sub_for_fd (self : t) fd k : unit =
+let add_write_sub_for_fd (self : _ t) fd k : unit =
   let fd_subs = get_or_create_subs self fd in
   fd_subs.writers <- k :: fd_subs.writers;
   update_poll_event self fd fd_subs
 
-let try_read_once_ fd buf i len =
-  try
-    let n = Unix.read fd buf i len in
-    Some n
-  with Unix.Unix_error ((Unix.EWOULDBLOCK | Unix.EAGAIN), _, _) -> None
-
-let try_write_once_ fd buf i len =
-  try
-    let n = Unix.write fd buf i len in
-    Some n
-  with Unix.Unix_error ((Unix.EWOULDBLOCK | Unix.EAGAIN), _, _) -> None
-
-let try_accept fd =
-  match Unix.accept fd with
-  | sock, addr -> Some (sock, addr)
-  | exception Unix.Unix_error ((Unix.EWOULDBLOCK | Unix.EAGAIN), _, _) -> None
-
-let do_read (self : t) k fd buf i len : unit =
-  try
-    match try_read_once_ fd buf i len with
-    | Some n -> E.continue k n
-    | None -> add_read_sub_for_fd self fd @@ Read (k, buf, i, len)
-  with e -> E.discontinue k e
-
-let do_write (self : t) k fd buf i len : unit =
-  try
-    match try_write_once_ fd buf i len with
-    | Some n -> E.continue k n
-    | None -> add_write_sub_for_fd self fd (k, buf, i, len)
-  with e -> E.discontinue k e
-
-let do_accept (self : t) k fd : unit =
-  try
-    match try_accept fd with
-    | Some (sock, addr) -> E.continue k (sock, addr)
-    | None -> add_read_sub_for_fd self fd @@ Accept k
-  with e -> E.discontinue k e
-
 (** Try to have one of the read subscribers do a read *)
-let try_to_wakeup_sub_read (self : t) fd : unit =
+let try_to_wakeup_sub_read (self : _ t) fd : unit =
   match Fd_tbl.find_opt self.fd_tbl fd with
   | None | Some { readers = []; _ } -> ()
-  | Some ({ readers = r0 :: tl; _ } as subs) ->
-    (match r0 with
-    | Accept k ->
-      (match try_accept fd with
-      | Some sock ->
-        subs.readers <- tl;
-        update_poll_event self fd subs;
-        enqueue_task self (fun () -> E.continue k sock)
-      | None -> ()
-      | exception e ->
-        subs.readers <- tl;
-        update_poll_event self fd subs;
-        E.discontinue k e)
-    | Read (k, buf, i, len) ->
-      (match try_read_once_ fd buf i len with
-      | Some n ->
-        subs.readers <- tl;
-        update_poll_event self fd subs;
-        enqueue_task self (fun () -> E.continue k n)
-      | None -> (* still registered *) ()
-      | exception e ->
-        subs.readers <- tl;
-        update_poll_event self fd subs;
-        E.discontinue k e))
+  | Some ({ readers = l; _ } as subs) ->
+    List.iter (fun k -> enqueue_task self (fun () -> E.continue k ())) l;
+    subs.readers <- [];
+    update_poll_event self fd subs
 
 (** Try to have one of the write subscribers do a write *)
-let try_to_wakeup_sub_write (self : t) fd : unit =
+let try_to_wakeup_sub_write (self : _ t) fd : unit =
   match Fd_tbl.find_opt self.fd_tbl fd with
   | None | Some { writers = []; _ } -> ()
-  | Some ({ writers = (k, buf, i, len) :: tl; _ } as subs) ->
-    (match try_write_once_ fd buf i len with
-    | Some n ->
-      subs.writers <- tl;
-      update_poll_event self fd subs;
-      enqueue_task self (fun () -> E.continue k n)
-    | None -> (* still registered *) ()
-    | exception e ->
-      subs.writers <- tl;
-      update_poll_event self fd subs;
-      E.discontinue k e)
+  | Some ({ writers = l; _ } as subs) ->
+    List.iter (fun k -> enqueue_task self (fun () -> E.continue k ())) l;
+    subs.writers <- [];
+    update_poll_event self fd subs
 
 let rec with_handler self f x =
   E.try_with f x
@@ -166,17 +100,30 @@ let rec with_handler self f x =
           | Effects_.Schedule f ->
             Some
               (fun (k : (a, _) E.continuation) ->
-                (* schedule [f] and resume *)
+                (* schedule [f] and resume the current computation *)
                 enqueue_task_with_handler self f;
                 E.continue k ())
-          | Effects_.Read (fd, buf, i, len) ->
+          | Effects_.Wait_read fd ->
             Some
-              (fun (k : (a, _) E.continuation) -> do_read self k fd buf i len)
-          | Effects_.Write (fd, buf, i, len) ->
+              (fun (k : (a, _) E.continuation) -> add_read_sub_for_fd self fd k)
+          | Effects_.Wait_write fd ->
             Some
-              (fun (k : (a, _) E.continuation) -> do_write self k fd buf i len)
-          | Effects_.Accept fd ->
-            Some (fun (k : (a, _) E.continuation) -> do_accept self k fd)
+              (fun (k : (a, _) E.continuation) ->
+                add_write_sub_for_fd self fd k)
+          | Effects_.Suspend f ->
+            Some
+              (fun (k : (a, _) E.continuation) ->
+                let k' () = enqueue_task self (fun () -> E.continue k ()) in
+                f k')
+          | Effects_.Close_fd fd ->
+            Some
+              (fun (k : (a, _) E.continuation) ->
+                (* TODO: cancel/discontinue waiters *)
+                Fd_tbl.remove self.fd_tbl fd;
+                E.continue k ())
+          | Effects_.Exit ->
+            if Atomic.exchange self.active false then Poll.close self.poll;
+            None
           | _ -> None);
     }
 
@@ -184,9 +131,9 @@ and enqueue_task_with_handler self f : unit =
   enqueue_task self (fun () -> with_handler self f ())
 
 (** run immediate tasks *)
-let run_microtasks (self : t) =
-  while not (Queue.is_empty self.q) do
-    let task = Queue.pop self.q in
+let run_microtasks (self : _ t) =
+  while not (Queue.is_empty self.micro_q) do
+    let task = Queue.pop self.micro_q in
     try task ()
     with e ->
       let bt = Printexc.get_raw_backtrace () in
@@ -194,7 +141,7 @@ let run_microtasks (self : t) =
         (Printexc.raw_backtrace_to_string bt)
   done
 
-let poll (self : t) : unit =
+let poll (self : _ t) : unit =
   (* now poll *)
   if Fd_tbl.length self.fd_tbl = 0 then
     (* nothing more to do.
@@ -206,19 +153,29 @@ let poll (self : t) : unit =
     match Poll.wait self.poll timeout with
     | `Timeout -> ()
     | `Ok ->
+      (* gather all newly ready tasks *)
+      let todo = ref [] in
       Poll.iter_ready self.poll ~f:(fun fd (ev : Poll.Event.t) ->
+          todo := (fd, ev) :: !todo);
+      Poll.clear self.poll;
+
+      (* now wake them up *)
+      List.iter
+        (fun ((fd, ev) : _ * Poll.Event.t) ->
           if ev.readable then try_to_wakeup_sub_read self fd;
           if ev.writable then try_to_wakeup_sub_write self fd)
+        !todo
   )
 
-let main_loop (self : t) : unit =
-  while Atomic.get self.active do
+let main_loop (self : _ t) : unit =
+  while Atomic.get self.active && not (Fiber.is_done self.main_task) do
     run_microtasks self;
     poll self
   done
 
-let run (self : t) (f : unit -> 'a) : 'a =
-  let _fiber, run = Fiber.Internal_.create f in
+let run (f : unit -> 'a) : 'a =
+  let fiber, run = Fiber.Internal_.create f in
+  let self = create fiber in
   enqueue_task_with_handler self run;
   main_loop self;
-  assert false (* TODO: have main loop stop when [fiber] is done *)
+  Fiber.join self.main_task

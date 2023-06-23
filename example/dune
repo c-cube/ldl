@@ -1,4 +1,4 @@
 
 (executables
-  (names cat tcp_echo)
+  (names cat tcp_echo tcp_client tcp_client_bench)
   (libraries ldl unix))
