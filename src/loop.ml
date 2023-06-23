@@ -30,22 +30,31 @@ type 'a worker = {
   active: bool Atomic.t;
   poll: Poll.t;  (** Main polling structure *)
   fd_tbl: Fd_subscribers.t Fd_tbl.t;  (** Subscribers for a given FD *)
-  micro_q: task Queue.t Lock_.t;  (** Tasks to run immediately (micro-queue) *)
+  micro_q: task Bb_queue.t;  (** Tasks to run immediately (micro-queue) *)
   main_task: 'a Fut.t;
 }
 
 type 'a t = {
+  j: int;
   workers: 'a worker array;  (** offset 0: main worker *)
   off: int A.t;  (** round robin *)
 }
 [@@ocaml.warning "-69"]
 
-let enqueue_task (self : _ t) (f : task) : unit =
+let[@inline] enqueue_task_on (self : _ worker) (f : task) =
+  Bb_queue.push self.micro_q f
+
+(** pick a worker *)
+let pick_worker_ (self : _ t) : _ worker =
+  let n = A.fetch_and_add self.off 1 in
+  let w = self.workers.(n mod Array.length self.workers) in
+  w
+
+let enqueue_task_any (self : _ t) (f : task) : unit =
   let n = A.fetch_and_add self.off 1 in
   (* pick which worker we enqueue this into *)
   let w = self.workers.(n mod Array.length self.workers) in
-  let@ q = Lock_.with_ w.micro_q in
-  Queue.push f q
+  enqueue_task_on w f
 
 let update_poll_event (self : _ worker) fd (subs : Fd_subscribers.t) =
   if Fd_subscribers.is_empty subs then
@@ -71,24 +80,24 @@ let add_write_sub_for_fd (self : _ worker) fd k : unit =
   update_poll_event self fd fd_subs
 
 (** Try to have one of the read subscribers do a read *)
-let try_to_wakeup_sub_read (self : _ worker) fd : unit =
-  match Fd_tbl.find_opt self.fd_tbl fd with
+let try_to_wakeup_sub_read (_self : _ t) (w : _ worker) fd : unit =
+  match Fd_tbl.find_opt w.fd_tbl fd with
   | None | Some { readers = []; _ } -> ()
   | Some ({ readers = l; _ } as subs) ->
-    List.iter (fun k -> enqueue_task self (fun () -> E.continue k ())) l;
+    List.iter (fun k -> enqueue_task_on w (fun () -> E.continue k ())) l;
     subs.readers <- [];
-    update_poll_event self fd subs
+    update_poll_event w fd subs
 
 (** Try to have one of the write subscribers do a write *)
-let try_to_wakeup_sub_write (self : _ worker) fd : unit =
-  match Fd_tbl.find_opt self.fd_tbl fd with
+let try_to_wakeup_sub_write (_self : _ t) (w : _ worker) fd : unit =
+  match Fd_tbl.find_opt w.fd_tbl fd with
   | None | Some { writers = []; _ } -> ()
   | Some ({ writers = l; _ } as subs) ->
-    List.iter (fun k -> enqueue_task self (fun () -> E.continue k ())) l;
+    List.iter (fun k -> enqueue_task_on w (fun () -> E.continue k ())) l;
     subs.writers <- [];
-    update_poll_event self fd subs
+    update_poll_event w fd subs
 
-let rec with_handler self f x =
+let rec with_handler (self : _ t) w f x =
   E.try_with f x
     {
       E.effc =
@@ -97,7 +106,7 @@ let rec with_handler self f x =
           | Effects_.Yield ->
             Some
               (fun (k : (a, _) E.continuation) ->
-                enqueue_task self (E.continue k))
+                enqueue_task_any self (E.continue k))
           | Effects_.Schedule f ->
             Some
               (fun (k : (a, _) E.continuation) ->
@@ -105,39 +114,37 @@ let rec with_handler self f x =
                 enqueue_task_with_handler self f;
                 E.continue k ())
           | Effects_.Wait_read fd ->
-            Some
-              (fun (k : (a, _) E.continuation) -> add_read_sub_for_fd self fd k)
+            Some (fun (k : (a, _) E.continuation) -> add_read_sub_for_fd w fd k)
           | Effects_.Wait_write fd ->
             Some
-              (fun (k : (a, _) E.continuation) ->
-                add_write_sub_for_fd self fd k)
+              (fun (k : (a, _) E.continuation) -> add_write_sub_for_fd w fd k)
           | Effects_.Suspend f ->
             Some
               (fun (k : (a, _) E.continuation) ->
-                let k' () = enqueue_task self (fun () -> E.continue k ()) in
+                let k' () = enqueue_task_on w (fun () -> E.continue k ()) in
                 f k')
           | Effects_.Close_fd fd ->
             Some
               (fun (k : (a, _) E.continuation) ->
                 (* TODO: cancel/discontinue waiters *)
-                Fd_tbl.remove self.fd_tbl fd;
+                Fd_tbl.remove w.fd_tbl fd;
                 E.continue k ())
           | Effects_.Exit ->
-            if Atomic.exchange self.active false then Poll.close self.poll;
+            if Atomic.exchange w.active false then Poll.close w.poll;
             None
           | _ -> None);
     }
 
 and enqueue_task_with_handler (self : _ t) f : unit =
-  enqueue_task self (fun () -> with_handler self f ())
+  let w = pick_worker_ self in
+  enqueue_task_on w (fun () -> with_handler self w f ())
 
 (** run immediate tasks *)
-let run_microtasks (self : _ worker) =
+let run_microtasks ~block self (w : _ worker) =
   let local_q = Queue.create () in
   while
     (* get tasks into [local_q] *)
-    (let@ q = Lock_.with_ self.micro_q in
-     Queue.transfer q local_q);
+    Bb_queue.pop_all ~block w.micro_q local_q;
 
     if Queue.is_empty local_q then
       false
@@ -145,49 +152,49 @@ let run_microtasks (self : _ worker) =
       (* execute tasks we just grabbed *)
       Queue.iter
         (fun task ->
-          try task ()
+          try with_handler self w task ()
           with e ->
             let bt = Printexc.get_raw_backtrace () in
             Printf.eprintf "uncaught exceptions: %s\n%s\n%!"
               (Printexc.to_string e)
               (Printexc.raw_backtrace_to_string bt))
         local_q;
+      Queue.clear local_q;
       true
     )
   do
     ()
   done
 
-let poll (self : _ worker) : unit =
+let poll (self : _ t) (w : _ worker) : unit =
   (* now poll *)
-  if Fd_tbl.length self.fd_tbl = 0 then
-    (* nothing more to do.
-       TODO: fail the future, if present *)
-    Atomic.set self.active false
+  if Fd_tbl.length w.fd_tbl = 0 then
+    (* nothing to poll, just wait for fibers *)
+    run_microtasks ~block:true self w
   else (
     (* TODO: compute actual timeout if we have a heap/timer wheel *)
     let timeout = Poll.Timeout.never in
-    match Poll.wait self.poll timeout with
+    match Poll.wait w.poll timeout with
     | `Timeout -> ()
     | `Ok ->
       (* gather all newly ready tasks *)
       let todo = ref [] in
-      Poll.iter_ready self.poll ~f:(fun fd (ev : Poll.Event.t) ->
+      Poll.iter_ready w.poll ~f:(fun fd (ev : Poll.Event.t) ->
           todo := (fd, ev) :: !todo);
-      Poll.clear self.poll;
+      Poll.clear w.poll;
 
       (* now wake them up *)
       List.iter
         (fun ((fd, ev) : _ * Poll.Event.t) ->
-          if ev.readable then try_to_wakeup_sub_read self fd;
-          if ev.writable then try_to_wakeup_sub_write self fd)
+          if ev.readable then try_to_wakeup_sub_read self w fd;
+          if ev.writable then try_to_wakeup_sub_write self w fd)
         !todo
   )
 
-let main_loop (self : _ t) (self : _ worker) : unit =
-  while Atomic.get self.active && not (Fut.is_done self.main_task) do
-    run_microtasks self;
-    poll self
+let main_loop (self : _ t) (w : _ worker) : unit =
+  while Atomic.get w.active && not (Fut.is_done w.main_task) do
+    run_microtasks ~block:false self w;
+    poll self w
   done
 
 let create main_task : _ t =
@@ -198,27 +205,26 @@ let create main_task : _ t =
       active;
       poll = Poll.create ();
       fd_tbl = Fd_tbl.create 128;
-      micro_q = Lock_.create @@ Queue.create ();
+      micro_q = Bb_queue.create ();
       main_task;
     }
   in
 
   let j = Domain.recommended_domain_count () - 1 in
 
-  let main_worker = mk_worker () in
-  let workers = Array.init j (fun _ -> mk_worker ()) in
-  { main_worker; workers; off = A.make 0 }
+  let workers = Array.init (j + 1) (fun _ -> mk_worker ()) in
+  { j; workers; off = A.make 0 }
 
 let run (f : unit -> 'a) : 'a =
   let fiber, run = Fut.Internal_.create f in
   let self = create fiber in
-  enqueue_task_with_handler self.main_worker run;
+  enqueue_task_with_handler self run;
 
   let domains =
-    Array.map
-      (fun worker -> Domain.spawn (fun () -> main_loop self worker))
-      self.workers
+    Array.init self.j (fun i ->
+        let w = self.workers.(i + 1) in
+        Domain.spawn (fun () -> main_loop self w))
   in
-  main_loop self self.main_worker;
+  main_loop self self.workers.(0);
   Array.iter Domain.join domains;
-  Fut.await self.main_worker.main_task
+  Fut.await self.workers.(0).main_task
